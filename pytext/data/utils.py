@@ -87,6 +87,13 @@ EOS = SpecialToken("__END_OF_SENTENCE__")
 BOL = SpecialToken("__BEGIN_OF_LIST__")
 EOL = SpecialToken("__END_OF_LIST__")
 MASK = SpecialToken("__MASK__")
+# BOS and EOS is too long for Byte-level Language Model.
+# Todo: find out conbination of bytes with low-frequency and shorter length
+BYTE_BOS = SpecialToken("^")
+BYTE_EOS = SpecialToken("#")
+BYTE_SPACE = SpecialToken(" ")
+UNK_INDEX = 0
+PAD_INDEX = 1
 
 
 class Vocabulary:
@@ -124,6 +131,7 @@ class Vocabulary:
             idx = self.idx.pop(token, len(self._vocab))
             if idx == len(self._vocab):
                 self._vocab.append(replacement)
+                self.counts.append(1)
             else:
                 self._vocab[idx] = replacement
             self.idx[replacement] = idx
@@ -164,19 +172,14 @@ class Vocabulary:
             else:
                 return self.idx[value], 0, 1
 
-        def lookup_value(value):
-            return (
-                self.lookup_all_internal(value) if should_iter(value) else lookup(value)
-            )
-
         if not should_iter(nested_values):
-            return lookup_value(nested_values)
+            return lookup(nested_values)
         else:
             indices = []
             unks = 0
             total = 0
             for value in nested_values:
-                v, unk, t = lookup_value(value)
+                v, unk, t = self.lookup_all_internal(value)
                 indices.append(v)
                 unks += unk
                 total += t
@@ -194,11 +197,17 @@ class Vocabulary:
         else:
             return self.idx.get(self.pad_token, value)
 
-    def get_bos_index(self):
-        return self.idx[self.bos_token]
+    def get_bos_index(self, value=None):
+        if value is None:
+            return self.idx[self.bos_token]
+        else:
+            return self.idx.get(self.bos_token, value)
 
-    def get_eos_index(self):
-        return self.idx[self.eos_token]
+    def get_eos_index(self, value=None):
+        if value is None:
+            return self.idx[self.eos_token]
+        else:
+            return self.idx.get(self.eos_token, value)
 
     def __getitem__(self, item):
         return self._vocab[item]
@@ -213,9 +222,9 @@ class VocabBuilder:
     def __init__(self, delimiter=" "):
         self._counter = Counter()
         self.use_unk = True
-        self.unk_index = 0
+        self.unk_index = UNK_INDEX
         self.use_pad = True
-        self.pad_index = 1
+        self.pad_index = PAD_INDEX
         self.use_bos = False
         self.bos_index = 2
         self.use_eos = False

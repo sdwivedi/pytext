@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+import contextlib
+import copy
+import sys
 from typing import List, Optional
 
 import torch
@@ -20,10 +23,14 @@ from pytext.data.tokenizers import Token, Tokenizer
 from pytext.torchscript.tensorizer import VectorNormalizer
 from pytext.utils import cuda, precision
 from pytext.utils.data import Slot
+from pytext.utils.file_io import PathManager
+from pytext.utils.lazy import lazy_property
 
 from .utils import (
     BOL,
     BOS,
+    BYTE_BOS,
+    BYTE_EOS,
     EOL,
     EOS,
     PAD,
@@ -33,6 +40,14 @@ from .utils import (
     align_target_label,
     pad_and_tensorize,
 )
+
+
+@contextlib.contextmanager
+def to_device(tensorizer_script_impl, device):
+    cur_device = tensorizer_script_impl.device
+    tensorizer_script_impl.device = device
+    yield
+    tensorizer_script_impl.device = cur_device
 
 
 def tokenize(
@@ -91,6 +106,98 @@ def lookup_tokens(
     return tokens, start_idx, end_idx
 
 
+class TensorizerScriptImpl(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.device: str = ""
+
+    @torch.jit.export
+    def set_device(self, device: str):
+        self.device = device
+
+    def batch_size(
+        self, texts: Optional[List[List[str]]], tokens: Optional[List[List[List[str]]]]
+    ) -> int:
+        if texts is not None:
+            return len(texts)
+        elif tokens is not None:
+            return len(tokens)
+        else:
+            raise RuntimeError("Empty input for both texts and tokens.")
+
+    def row_size(
+        self, texts: Optional[List[List[str]]], tokens: Optional[List[List[List[str]]]]
+    ) -> int:
+        if texts is not None:
+            return len(texts[0])
+        elif tokens is not None:
+            return len(tokens[0])
+        else:
+            raise RuntimeError("Empty input for both texts and tokens.")
+
+    def get_texts_by_index(
+        self, texts: Optional[List[List[str]]], index: int
+    ) -> Optional[List[str]]:
+        if texts is None:
+            return None
+        return texts[index]
+
+    def get_tokens_by_index(
+        self, tokens: Optional[List[List[List[str]]]], index: int
+    ) -> Optional[List[List[str]]]:
+        if tokens is None:
+            return None
+        return tokens[index]
+
+    def tokenize(self, *args, **kwargs):
+        """
+        This functions will receive the inputs from Clients, usually there are
+        two possible inputs
+        1) a row of texts: List[str]
+        2) a row of pre-processed tokens: List[List[str]]
+
+        Override this function to be TorchScriptable, e.g you need to declare
+        concrete input arguments with type hints.
+        """
+        raise NotImplementedError
+
+    def numberize(self, *args, **kwargs):
+        """
+        This functions will receive the outputs from function: tokenize() or
+        will be called directly from PyTextTensorizer function: numberize().
+
+        Override this function to be TorchScriptable, e.g you need to declare
+        concrete input arguments with type hints.
+        """
+        raise NotImplementedError
+
+    def tensorize(self, *args, **kwargs):
+        """
+        This functions will receive a list(e.g a batch) of outputs
+        from function numberize(), padding and convert to output tensors.
+
+        Override this function to be TorchScriptable, e.g you need to declare
+        concrete input arguments with type hints.
+        """
+        raise NotImplementedError
+
+    @torch.jit.ignore
+    def tensorize_wrapper(self, *args, **kwargs):
+        """
+        This functions will receive a list(e.g a batch) of outputs
+        from function numberize(), padding and convert to output tensors.
+
+        It will be called in PyText Tensorizer during training time, this
+        function is not torchscriptiable because it depends on cuda.device().
+        """
+        with to_device(self, cuda.device()):
+            return self.tensorize(*args, **kwargs)
+
+    @torch.jit.ignore
+    def torchscriptify(self):
+        return torch.jit.script(self)
+
+
 class Tensorizer(Component):
     """Tensorizers are a component that converts from batches of
     `pytext.data.type.DataType` instances to tensors. These tensors will eventually
@@ -106,12 +213,18 @@ class Tensorizer(Component):
 
     __COMPONENT_TYPE__ = ComponentType.TENSORIZER
     __EXPANSIBLE__ = True
+    __TENSORIZER_SCRIPT_IMPL__ = None
 
     class Config(Component.Config):
-        pass
+        # Indicate if it can be used to generate input Tensors for prediction
+        is_input: bool = True
 
-    # Indicate if it can be used to generate input Tensors for prediction
-    is_input = True
+    @classmethod
+    def from_config(cls, config: Config):
+        return cls(config.is_input)
+
+    def __init__(self, is_input: bool = True):
+        self.is_input = is_input
 
     @property
     def column_schema(self):
@@ -160,8 +273,20 @@ class Tensorizer(Component):
         # we need yield here to make this function a generator
         yield
 
-    def torchscriptify(self):
+    @lazy_property
+    def tensorizer_script_impl(self):
+        # Script tensorizer is unpickleable, we use lazy_property for
+        # lazy initialization to construct the object during run time.
         raise NotImplementedError
+
+    def __getstate__(self):
+        # make a shallow copy of state to avoid side effect on the original object
+        state = copy.copy(vars(self))
+        state.pop("tensorizer_script_impl", None)
+        return state
+
+    def torchscriptify(self):
+        return self.tensorizer_script_impl.torchscriptify()
 
 
 class VocabFileConfig(Component.Config):
@@ -215,6 +340,7 @@ class TokenTensorizer(Tensorizer):
             max_seq_len=config.max_seq_len,
             vocab_config=config.vocab,
             vocab_file_delimiter=config.vocab_file_delimiter,
+            is_input=config.is_input,
         )
 
     def __init__(
@@ -228,6 +354,7 @@ class TokenTensorizer(Tensorizer):
         vocab_config=None,
         vocab=None,
         vocab_file_delimiter=" ",
+        is_input=Config.is_input,
     ):
         self.text_column = text_column
         self.tokenizer = tokenizer or Tokenizer()
@@ -239,6 +366,7 @@ class TokenTensorizer(Tensorizer):
         self.vocab_builder = None
         self.vocab_config = vocab_config or VocabConfig()
         self.vocab_file_delimiter = vocab_file_delimiter
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -313,7 +441,7 @@ class TokenTensorizer(Tensorizer):
 
     def _add_vocab_from_files(self):
         for vocab_file in self.vocab_config.vocab_files:
-            with open(vocab_file.filepath) as f:
+            with PathManager.open(vocab_file.filepath) as f:
                 self.vocab_builder.add_from_file(
                     f,
                     vocab_file.skip_header_line,
@@ -331,7 +459,7 @@ class TokenTensorizer(Tensorizer):
         """Tokenize, look up in vocabulary, return tokenized_texts in raw text"""
         tokenized_texts, start_idx, end_idx = self._tokenize(row[self.text_column])
         token_ranges = list(zip(start_idx, end_idx))
-        return tokenized_texts, len(tokenized_texts), token_ranges
+        return list(tokenized_texts), len(tokenized_texts), token_ranges
 
     def tensorize(self, batch):
         tokens, seq_lens, token_ranges = zip(*batch)
@@ -360,15 +488,39 @@ class ByteTensorizer(Tensorizer):
         column: str = "text"
         lower: bool = True
         max_seq_len: Optional[int] = None
+        add_bos_token: Optional[bool] = False
+        add_eos_token: Optional[bool] = False
+        use_eos_token_for_bos: Optional[bool] = False
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(config.column, config.lower, config.max_seq_len)
+        return cls(
+            config.column,
+            config.lower,
+            config.max_seq_len,
+            config.add_bos_token,
+            config.add_eos_token,
+            config.use_eos_token_for_bos,
+            config.is_input,
+        )
 
-    def __init__(self, text_column, lower=True, max_seq_len=None):
+    def __init__(
+        self,
+        text_column,
+        lower=True,
+        max_seq_len=None,
+        add_bos_token=Config.add_bos_token,
+        add_eos_token=Config.add_eos_token,
+        use_eos_token_for_bos=Config.use_eos_token_for_bos,
+        is_input=Config.is_input,
+    ):
         self.text_column = text_column
         self.lower = lower
         self.max_seq_len = max_seq_len
+        self.add_bos_token = add_bos_token
+        self.add_eos_token = add_eos_token
+        self.use_eos_token_for_bos = use_eos_token_for_bos
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -376,12 +528,30 @@ class ByteTensorizer(Tensorizer):
 
     def numberize(self, row):
         """Convert text to characters."""
-        text = row[self.text_column]
+        text = row[self.text_column].strip()
+
         if self.lower:
             text = text.lower()
+
         bytes = list(text.encode())
+
         if self.max_seq_len:
             bytes = bytes[: self.max_seq_len]
+        if self.add_bos_token:
+            bos = BYTE_EOS if self.use_eos_token_for_bos else BYTE_BOS
+            if bos in text:
+                print('Special token "{}" exists in text "{}". Exit.'.format(bos, text))
+                sys.exit(1)
+            bytes = list(bos.encode()) + bytes
+        if self.add_eos_token:
+            if BYTE_EOS in text:
+                print(
+                    'Special token "{}" exists in text "{}". Exit.'.format(
+                        BYTE_EOS, text
+                    )
+                )
+                sys.exit(1)
+            bytes = bytes + list(BYTE_EOS.encode())
         return bytes, len(bytes)
 
     def tensorize(self, batch):
@@ -428,6 +598,7 @@ class ByteTokenTensorizer(Tensorizer):
             add_bos_token=config.add_bos_token,
             add_eos_token=config.add_eos_token,
             use_eos_token_for_bos=config.use_eos_token_for_bos,
+            is_input=config.is_input,
         )
 
     def __init__(
@@ -440,6 +611,7 @@ class ByteTokenTensorizer(Tensorizer):
         add_bos_token=Config.add_bos_token,
         add_eos_token=Config.add_eos_token,
         use_eos_token_for_bos=Config.use_eos_token_for_bos,
+        is_input=Config.is_input,
     ):
         self.text_column = text_column
         self.tokenizer = tokenizer or Tokenizer()
@@ -449,6 +621,7 @@ class ByteTokenTensorizer(Tensorizer):
         self.add_bos_token = add_bos_token
         self.add_eos_token = add_eos_token
         self.use_eos_token_for_bos = use_eos_token_for_bos
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -456,7 +629,9 @@ class ByteTokenTensorizer(Tensorizer):
 
     def numberize(self, row):
         """Convert text to bytes, pad batch."""
-        tokens = self.tokenizer.tokenize(row[self.text_column])[: self.max_seq_len]
+        tokens = self.tokenizer.tokenize(row[self.text_column])[
+            : (self.max_seq_len - self.add_bos_token - self.add_eos_token)
+        ]
         if self.add_bos_token:
             bos = EOS if self.use_eos_token_for_bos else BOS
             tokens = [Token(bos, -1, -1)] + tokens
@@ -548,13 +723,17 @@ class LabelTensorizer(Tensorizer):
         pad_in_vocab: bool = False
         #: The label values, if known. Will skip initialization step if provided.
         label_vocab: Optional[List[str]] = None
-
-    is_input = False
+        # Indicate if it can be used to generate input Tensors for prediction
+        is_input: bool = False
 
     @classmethod
     def from_config(cls, config: Config):
         return cls(
-            config.column, config.allow_unknown, config.pad_in_vocab, config.label_vocab
+            config.column,
+            config.allow_unknown,
+            config.pad_in_vocab,
+            config.label_vocab,
+            config.is_input,
         )
 
     def __init__(
@@ -563,6 +742,7 @@ class LabelTensorizer(Tensorizer):
         allow_unknown: bool = False,
         pad_in_vocab: bool = False,
         label_vocab: Optional[List[str]] = None,
+        is_input: bool = Config.is_input,
     ):
         self.label_column = label_column
         self.pad_in_vocab = pad_in_vocab
@@ -574,6 +754,7 @@ class LabelTensorizer(Tensorizer):
         if label_vocab:
             self.vocab_builder.add_all(label_vocab)
             self.vocab, self.pad_idx = self._create_vocab()
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -645,9 +826,14 @@ class UidTensorizer(Tensorizer):
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(config.column, config.allow_unknown)
+        return cls(config.column, config.allow_unknown, config.is_input)
 
-    def __init__(self, uid_column: str = "uid", allow_unknown: bool = True):
+    def __init__(
+        self,
+        uid_column: str = "uid",
+        allow_unknown: bool = True,
+        is_input: bool = Config.is_input,
+    ):
         self.uid_column = uid_column
         self.vocab_builder = VocabBuilder()
         # User IDs should have the same lengths so need not to use padding.
@@ -655,6 +841,7 @@ class UidTensorizer(Tensorizer):
         self.vocab_builder.use_unk = allow_unknown
         self.vocab = None
         self.pad_idx = -1
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -719,6 +906,7 @@ class SoftLabelTensorizer(LabelTensorizer):
             config.probs_column,
             config.logits_column,
             config.labels_column,
+            config.is_input,
         )
 
     def __init__(
@@ -730,8 +918,11 @@ class SoftLabelTensorizer(LabelTensorizer):
         probs_column: str = "target_probs",
         logits_column: str = "target_logits",
         labels_column: str = "target_labels",
+        is_input: bool = Config.is_input,
     ):
-        super().__init__(label_column, allow_unknown, pad_in_vocab, label_vocab)
+        super().__init__(
+            label_column, allow_unknown, pad_in_vocab, label_vocab, is_input
+        )
         self.probs_column = probs_column
         self.logits_column = logits_column
         self.labels_column = labels_column
@@ -773,23 +964,25 @@ class NumericLabelTensorizer(Tensorizer):
         #: If provided, the range of values the raw label can be. Will rescale the
         #: label values to be within [0, 1].
         rescale_range: Optional[List[float]] = None
-
-    is_input = False
+        # Indicate if it can be used to generate input Tensors for prediction
+        is_input: bool = False
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(config.column, config.rescale_range)
+        return cls(config.column, config.rescale_range, config.is_input)
 
     def __init__(
         self,
         label_column: str = Config.column,
         rescale_range: Optional[List[float]] = Config.rescale_range,
+        is_input: bool = Config.is_input,
     ):
         self.label_column = label_column
         if rescale_range is not None:
             assert len(rescale_range) == 2
             assert rescale_range[0] < rescale_range[1]
         self.rescale_range = rescale_range
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -824,16 +1017,28 @@ class FloatListTensorizer(Tensorizer):
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(config.column, config.error_check, config.dim, config.normalize)
+        return cls(
+            config.column,
+            config.error_check,
+            config.dim,
+            config.normalize,
+            config.is_input,
+        )
 
     def __init__(
-        self, column: str, error_check: bool, dim: Optional[int], normalize: bool
+        self,
+        column: str,
+        error_check: bool,
+        dim: Optional[int],
+        normalize: bool,
+        is_input: bool = Config.is_input,
     ):
         self.column = column
         self.error_check = error_check
         self.dim = dim
         self.normalizer = VectorNormalizer(dim, normalize)
         assert not self.error_check or self.dim is not None, "Error check requires dim"
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -882,14 +1087,18 @@ class SlotLabelTensorizer(Tensorizer):
         tokenizer: Tokenizer.Config = Tokenizer.Config()
         #: Whether to allow for unknown labels at test/prediction time
         allow_unknown: bool = False
-
-    is_input = False
+        # Indicate if it can be used to generate input Tensors for prediction
+        is_input: bool = False
 
     @classmethod
-    def from_config(cls, config: Component.Config):
+    def from_config(cls, config: Config):
         tokenizer = create_component(ComponentType.TOKENIZER, config.tokenizer)
         return cls(
-            config.slot_column, config.text_column, tokenizer, config.allow_unknown
+            config.slot_column,
+            config.text_column,
+            tokenizer,
+            config.allow_unknown,
+            config.is_input,
         )
 
     def __init__(
@@ -898,6 +1107,7 @@ class SlotLabelTensorizer(Tensorizer):
         text_column: str = Config.text_column,
         tokenizer: Tokenizer = None,
         allow_unknown: bool = Config.allow_unknown,
+        is_input: bool = Config.is_input,
     ):
         self.slot_column = slot_column
         self.text_column = text_column
@@ -909,6 +1119,7 @@ class SlotLabelTensorizer(Tensorizer):
         self.vocab_builder.use_pad = False
         self.vocab_builder.use_unk = self.allow_unknown
         self.vocab = None
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -1008,19 +1219,21 @@ class GazetteerTensorizer(Tensorizer):
     @classmethod
     def from_config(cls, config: Config):
         tokenizer = create_component(ComponentType.TOKENIZER, config.tokenizer)
-        return cls(config.text_column, config.dict_column, tokenizer)
+        return cls(config.text_column, config.dict_column, tokenizer, config.is_input)
 
     def __init__(
         self,
         text_column: str = Config.text_column,
         dict_column: str = Config.dict_column,
         tokenizer: Tokenizer = None,
+        is_input: bool = Config.is_input,
     ):
         self.text_column = text_column
         self.dict_column = dict_column
         self.tokenizer = tokenizer or Tokenizer()
         self.vocab_builder = VocabBuilder()
         self.vocab = None
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -1180,6 +1393,7 @@ class SeqTokenTensorizer(Tensorizer):
             add_eol_token=config.add_eol_token,
             use_eol_token_for_bol=config.use_eol_token_for_bol,
             max_seq_len=config.max_seq_len,
+            is_input=config.is_input,
         )
 
     def __init__(
@@ -1194,6 +1408,7 @@ class SeqTokenTensorizer(Tensorizer):
         use_eol_token_for_bol: bool = Config.use_eol_token_for_bol,
         max_seq_len=Config.max_seq_len,
         vocab=None,
+        is_input: bool = Config.is_input,
     ):
         self.column = column
         self.tokenizer = tokenizer or Tokenizer()
@@ -1206,6 +1421,7 @@ class SeqTokenTensorizer(Tensorizer):
         self.add_eol_token = add_eol_token
         self.use_eol_token_for_bol = use_eol_token_for_bol
         self.max_seq_len = max_seq_len or 2 ** 30  # large number
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -1315,12 +1531,15 @@ class AnnotationNumberizer(Tensorizer):
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(column=config.column)
+        return cls(column=config.column, is_input=config.is_input)
 
-    def __init__(self, column: str = Config.column, vocab=None):
+    def __init__(
+        self, column: str = Config.column, vocab=None, is_input: bool = Config.is_input
+    ):
         self.column = column
         self.vocab = vocab
         self.vocab_builder = None
+        super().__init__(is_input)
 
     @property
     def column_schema(self):
@@ -1370,16 +1589,19 @@ class MetricTensorizer(Tensorizer):
     class Config(Tensorizer.Config):
         names: List[str]
         indexes: List[int]
-
-    is_input = False
+        # Indicate if it can be used to generate input Tensors for prediction
+        is_input: bool = False
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(config.names, config.indexes)
+        return cls(config.names, config.indexes, config.is_input)
 
-    def __init__(self, names: List[str], indexes: List[int]):
+    def __init__(
+        self, names: List[str], indexes: List[int], is_input: bool = Config.is_input
+    ):
         self.names = names
         self.indexes = indexes
+        super().__init__(is_input)
 
     def numberize(self, row):
         # metric tensorizer will depends on other tensorizers' numeric result
@@ -1410,10 +1632,11 @@ class FloatTensorizer(Tensorizer):
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls(config.column)
+        return cls(config.column, config.is_input)
 
-    def __init__(self, column: str):
+    def __init__(self, column: str, is_input: bool = Config.is_input):
         self.column = column
+        super().__init__(is_input)
 
     @property
     def column_schema(self):

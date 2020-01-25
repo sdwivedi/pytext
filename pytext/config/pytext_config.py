@@ -91,6 +91,8 @@ class PyTextConfig(ConfigBase):
     use_fp16: bool = False
     # Total Number of GPUs to run the training on (for CPU jobs this has to be 1)
     distributed_world_size: int = 1
+    # Total number of GPU streams for gradient sync in distributed training
+    gpu_streams_for_distributed_training: int = 1
     # load either model or checkpoint(model + config + training_state etc)
     # load model file for inference only, load checkpont file to continue training
     load_snapshot_path: str = ""
@@ -127,6 +129,12 @@ class PyTextConfig(ConfigBase):
     include_dirs: Optional[List[str]] = None
     # config version
     version: int
+    # Use CUDA for testing. Set to false for models where testing on CPU is
+    # preferred. This option allows one to train on GPU and test on CPU by
+    # setting use_cuda_if_available=True and use_cuda_for_testing=False. Note
+    # that if use_cuda_if_available=False or CUDA is not available, this
+    # parameter has no effect.
+    use_cuda_for_testing: bool = True
 
     # TODO these two configs are only kept only to be backward comptible with
     # RNNG, should be removed once RNNG refactoring is done
@@ -149,4 +157,9 @@ class TestConfig(ConfigBase):
     test_out_path: str = ""
 
 
-LATEST_VERSION = 18
+class LogitsConfig(TestConfig):
+    # Whether to dump the raw input to output file.
+    dump_raw_input: bool = False
+
+
+LATEST_VERSION = 19

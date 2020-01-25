@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import copy
+import json
 import re
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Union
 
 from fairseq.data.encoders.gpt2_bpe import get_encoder as create_gpt2_bpe
 from fairseq.data.encoders.gpt2_bpe_utils import Encoder as GPT2BPEEncoder
@@ -71,15 +72,24 @@ class DoNothingTokenizer(Tokenizer):
 
     class Config(Component.Config):
         do_nothing: str = ""
+        json_input: bool = False
 
     @classmethod
     def from_config(cls, config: Config):
-        return cls()
+        return cls(config.json_input)
 
-    def __init__(self):
+    def __init__(self, json_input: bool = False):
         super().__init__(None)
+        self.json_input = json_input
 
-    def tokenize(self, input: List[str]) -> List[Token]:
+    def tokenize(self, input: Union[List[str], str]) -> List[Token]:
+        if self.json_input:
+            # This is needed for student training in fluent2, since the text input is
+            # a list of tokens serialized into a json string
+            assert isinstance(input, str)
+            input = json.loads(input)
+        else:
+            assert isinstance(input, List)
         tokens = [Token(token_text, -1, -1) for token_text in input if token_text]
         return tokens
 
@@ -210,6 +220,15 @@ class GPT2BPETokenizer(Tokenizer):
     def tokenize(self, input_str: str) -> List[Token]:
         bpe_ids = self.bpe.encode(input_str)
         char_tokens = [self.bpe.decoder[id].lstrip(u"\u0120") for id in bpe_ids]
+        # fix for incorrect decoding of utf-8 chars
+        for i, char_token in enumerate(char_tokens):
+            try:
+                char_tokens[i] = bytearray(
+                    [self.bpe.byte_decoder[char] for char in char_token]
+                ).decode("utf-8")
+            # handles BPE breaking a single multi-byte char into pieces
+            except UnicodeDecodeError:
+                continue
         lengths = [len(token) for token in char_tokens]
         tokens = []
         end = 0
@@ -217,6 +236,9 @@ class GPT2BPETokenizer(Tokenizer):
             start = input_str.find(char_token, end)
             end = start + length
             tokens.append(Token(str(id), start, end))
+            # handles bad start/end indices cascading to subsequent tokens.
+            if len(tokens) > 1 and end < tokens[-2].end:
+                end = tokens[-2].end
         return [token for token in tokens if token.value]
 
 
@@ -257,6 +279,3 @@ class SentencePieceTokenizer(Tokenizer, CppProcessorMixin):
     def _load_processor(self):
         self.processor = SentencePieceProcessor()
         self.processor.Load(self.sp_model_path)
-
-    def torchscriptify(self):
-        return ScriptDoNothingTokenizer()

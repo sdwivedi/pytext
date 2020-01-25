@@ -7,7 +7,14 @@ from typing import Tuple
 
 import torch
 from pytext.common.constants import Stage
+from pytext.utils.file_io import PathManager
 from torch.utils.tensorboard import SummaryWriter
+
+
+try:
+    from torch.utils.tensorboard.fb.profile import profile_graph
+except ImportError:
+    profile_graph = None
 
 
 class Channel:
@@ -113,7 +120,7 @@ class FileChannel(Channel):
         *args,
     ):
         print(f"saving result to file {self.file_path}")
-        with open(self.file_path, "w", encoding="utf-8") as of:
+        with PathManager.open(self.file_path, "w", encoding="utf-8") as of:
             tsv_writer = csv.writer(
                 of,
                 delimiter="\t",
@@ -170,6 +177,7 @@ class TensorBoardChannel(Channel):
         context,
         meta,
         model,
+        optimizer,
         *args,
     ):
         """
@@ -213,20 +221,38 @@ class TensorBoardChannel(Channel):
                 self.add_scalars(prefix, metrics, epoch)
 
         if stage == Stage.TRAIN:
+            if optimizer is not None:
+                for idx, param_group in enumerate(optimizer.param_groups):
+                    self.summary_writer.add_scalar(
+                        f"optimizer.lr.param_group.{idx}", param_group["lr"], epoch
+                    )
             for key, val in model.named_parameters():
                 if val is not None and len(val) > 0 and not (val == 0).all():
                     limit = 9.9e19
+                    grad = val.grad
                     val = torch.clamp(val.float(), -limit, limit)
-                    self.summary_writer.add_histogram(key, val, epoch)
-                    if (
-                        val.grad is not None
-                        and len(val.grad) > 0
-                        and not (val.grad == 0).all()
-                    ):
-                        grad = torch.clamp(val.grad.float(), -limit, limit)
-                        self.summary_writer.add_histogram(
-                            key + "_gradients", grad, epoch
+                    try:
+                        self.summary_writer.add_histogram(key, val, epoch)
+                    except Exception:
+                        print(
+                            f"WARNING: Param {key} cannot be sent to Tensorboard",
+                            file=sys.stderr,
                         )
+                        traceback.print_exc(file=sys.stderr)
+
+                    if grad is not None and len(grad) > 0 and not (grad == 0).all():
+                        grad = torch.clamp(grad.float(), -limit, limit)
+                        try:
+                            self.summary_writer.add_histogram(
+                                key + "_gradients", grad, epoch
+                            )
+                        except Exception:
+                            print(
+                                f"WARNING: Grad for param {key} "
+                                "cannot be sent to Tensorboard",
+                                file=sys.stderr,
+                            )
+                            traceback.print_exc(file=sys.stderr)
 
     def add_texts(self, tag, metrics):
         """
@@ -287,6 +313,16 @@ class TensorBoardChannel(Channel):
         except Exception:
             print(
                 "WARNING: Unable to export neural network graph to TensorBoard.",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+
+        try:
+            if profile_graph is not None:
+                profile_graph(self.summary_writer, model, input_to_model)
+        except Exception:
+            print(
+                "WARNING: Unable to export performance graph to Tensor Board.",
                 file=sys.stderr,
             )
             traceback.print_exc(file=sys.stderr)

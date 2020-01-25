@@ -6,7 +6,11 @@ from typing import List
 
 import numpy as np
 import torch
-from pytext.data.bert_tensorizer import BERTTensorizer
+from pytext.data.bert_tensorizer import BERTTensorizer, BERTTensorizerScriptImpl
+from pytext.data.roberta_tensorizer import (
+    RoBERTaTensorizer,
+    RoBERTaTensorizerScriptImpl,
+)
 from pytext.data.sources import SquadDataSource
 from pytext.data.sources.data_source import Gazetteer, SafeFileWrapper, load_float_list
 from pytext.data.sources.tsv import SessionTSVDataSource, TSVDataSource
@@ -30,7 +34,12 @@ from pytext.data.tensorizers import (
     initialize_tensorizers,
     lookup_tokens,
 )
-from pytext.data.tokenizers import GPT2BPETokenizer, Tokenizer, WordPieceTokenizer
+from pytext.data.tokenizers import (
+    DoNothingTokenizer,
+    GPT2BPETokenizer,
+    Tokenizer,
+    WordPieceTokenizer,
+)
 from pytext.data.utils import BOS, EOS, Vocabulary
 from pytext.utils.test import import_tests_module
 
@@ -238,6 +247,21 @@ class TensorizersTest(unittest.TestCase):
 
         tensors = [tensorizer.numberize(row) for row in rows]
         self.assertEqual([(bytes, len(bytes)) for bytes in expected], tensors)
+
+    def test_byte_tensors_error_code(self):
+        tensorizer = ByteTensorizer(
+            text_column="text", lower=False, add_bos_token=True, add_eos_token=True
+        )
+        s1 = "I want some coffee#"
+        s2 = "This is ^the best show I've ever seen"
+
+        rows = [{"text": s1}, {"text": s2}]
+        expected_error_code = 1
+        with self.assertRaises(SystemExit) as cm:
+            for row in rows:
+                tensorizer.numberize(row)
+
+        self.assertEqual(cm.exception.code, expected_error_code)
 
     def test_create_byte_token_tensors(self):
         tensorizer = ByteTokenTensorizer(
@@ -723,6 +747,12 @@ class BERTTensorizerTest(unittest.TestCase):
                 )
             )
         )
+        tensorizer_impl = BERTTensorizerScriptImpl(
+            tokenizer=DoNothingTokenizer(),
+            vocab=tensorizer.vocab,
+            max_seq_len=tensorizer.max_seq_len,
+        ).torchscriptify()
+
         tokens, segment_label, seq_len, positions = tensorizer.numberize(row)
         self.assertEqual(tokens, expected)
         self.assertEqual(seq_len, len(expected))
@@ -730,6 +760,19 @@ class BERTTensorizerTest(unittest.TestCase):
 
         tokens, pad_mask, segment_labels, _ = tensorizer.tensorize(
             [(tokens, segment_label, seq_len, positions)]
+        )
+        self.assertEqual(pad_mask[0].tolist(), [1] * len(expected))
+
+        per_sentence_tokens = [tensorizer.tokenizer.tokenize(sentence)]
+        tokens, segment_label, seq_len, positions = tensorizer_impl.numberize(
+            per_sentence_tokens
+        )
+        self.assertEqual(tokens, expected)
+        self.assertEqual(seq_len, len(expected))
+        self.assertEqual(segment_label, [0] * len(expected))
+
+        tokens, pad_mask, segment_labels, _ = tensorizer_impl.tensorize(
+            [tokens], [segment_label], [seq_len], [positions]
         )
         self.assertEqual(pad_mask[0].tolist(), [1] * len(expected))
 
@@ -750,6 +793,48 @@ class BERTTensorizerTest(unittest.TestCase):
         self.assertEqual(tokens, expected_tokens)
         self.assertEqual(segment_labels, expected_segment_labels)
         self.assertEqual(seq_len, len(expected_tokens))
+
+
+class RobertaTensorizerTest(unittest.TestCase):
+    def test_roberta_tensorizer(self):
+        text = "Prototype"
+        tokens = [[0, 4, 5, 2]]
+        pad_masks = [[1, 1, 1, 1]]
+        segment_labels = [[0, 0, 0, 0]]
+        positions = [[0, 1, 2, 3]]
+        expected = [tokens, pad_masks, segment_labels, positions]
+
+        tensorizer = RoBERTaTensorizer.from_config(
+            RoBERTaTensorizer.Config(
+                tokenizer=GPT2BPETokenizer.Config(
+                    bpe_encoder_path="pytext/data/test/data/gpt2_encoder.json",
+                    bpe_vocab_path="pytext/data/test/data/gpt2_vocab.bpe",
+                ),
+                vocab_file="pytext/data/test/data/gpt2_dict.txt",
+                max_seq_len=256,
+            )
+        )
+        tensors = tensorizer.tensorize([tensorizer.numberize({"text": text})])
+        for tensor, expect in zip(tensors, expected):
+            self.assertEqual(tensor.tolist(), expect)
+
+        tensorizer_impl = RoBERTaTensorizerScriptImpl(
+            tokenizer=DoNothingTokenizer(),
+            vocab=tensorizer.vocab,
+            max_seq_len=tensorizer.max_seq_len,
+        )
+        script_tensorizer_impl = tensorizer_impl.torchscriptify()
+        per_sentence_tokens = [tensorizer.tokenizer.tokenize(text)]
+        tokens_2d, segment_labels_2d, seq_lens_1d, positions_2d = zip(
+            *[script_tensorizer_impl.numberize(per_sentence_tokens)]
+        )
+        script_tensors = script_tensorizer_impl.tensorize(
+            tokens_2d, segment_labels_2d, seq_lens_1d, positions_2d
+        )
+        for tensor, expect in zip(script_tensors, expected):
+            self.assertEqual(tensor.tolist(), expect)
+        # test it is able to call torchscriptify multiple time
+        tensorizer_impl.torchscriptify()
 
 
 class SquadForRobertaTensorizerTest(unittest.TestCase):

@@ -66,10 +66,12 @@ def _set_fp16(use_fp16: bool, rank: int) -> None:
 
 
 def _set_distributed(
-    rank: int, world_size: int, dist_init_url: str, device_id: int
+    rank: int, world_size: int, dist_init_url: str, device_id: int, gpu_streams: int = 1
 ) -> None:
     if dist_init_url and world_size > 1:
-        distributed.dist_init(rank, world_size, dist_init_url, device_id)
+        distributed.dist_init(
+            rank, world_size, dist_init_url, device_id, gpu_streams=gpu_streams
+        )
 
 
 def prepare_task_metadata(config: PyTextConfig) -> CommonMetadata:
@@ -120,7 +122,13 @@ def prepare_task(
         print("\nParameters: {}\n".format(config), flush=True)
     _set_cuda(config.use_cuda_if_available, device_id, world_size)
     _set_fp16(config.use_fp16, rank)
-    _set_distributed(rank, world_size, dist_init_url, device_id)
+    _set_distributed(
+        rank,
+        world_size,
+        dist_init_url,
+        device_id,
+        config.gpu_streams_for_distributed_training,
+    )
 
     if config.random_seed is not None:
         set_random_seeds(config.random_seed, config.use_deterministic_cudnn)
@@ -294,11 +302,13 @@ def get_logits(
     output_path: Optional[str] = None,
     test_path: Optional[str] = None,
     field_names: Optional[List[str]] = None,
+    dump_raw_input: bool = False,
 ):
     _set_cuda(use_cuda_if_available)
     task, train_config, _traing_state = load(snapshot_path)
     print(f"Successfully loaded model from {snapshot_path}")
     print(f"Model on GPU? {next(task.model.parameters()).is_cuda}")
+
     if isinstance(task, NewTask):
         task.model.eval()
         data_source = _get_data_source(
@@ -308,24 +318,38 @@ def get_logits(
         task.data.sort_key = None
         batches = task.data.batches(Stage.TEST, data_source=data_source)
 
-        with open(output_path, "w", encoding="utf-8") as fout, torch.no_grad():
-            for (_, tensor_dict) in batches:
+        with PathManager.open(
+            output_path, "w", encoding="utf-8"
+        ) as fout, torch.no_grad():
+            for (raw_batch, tensor_dict) in batches:
+                raw_input_tuple = (
+                    dict_zip(*raw_batch, value_only=True) if dump_raw_input else ()
+                )
                 model_inputs = task.model.arrange_model_inputs(tensor_dict)
                 model_outputs = task.model(*model_inputs)
                 if isinstance(model_outputs, tuple):
-                    model_outputs_list = [m.tolist() for m in model_outputs]
-                    for row in zip(*model_outputs_list):
-                        # row is a tuple of lists
+                    model_outputs_tuple = tuple(m.tolist() for m in model_outputs)
+                    for row in zip(*raw_input_tuple, *model_outputs_tuple):
                         dump_row = "\t".join(json.dumps(r) for r in row)
                         fout.write(f"{dump_row}\n")
                 elif isinstance(model_outputs, torch.Tensor):
                     model_outputs_list = model_outputs.tolist()
-                    for row in zip(model_outputs_list):
-                        fout.write(f"{json.dumps(row)}\n")
+                    for row in zip(*raw_input_tuple, model_outputs_list):
+                        dump_row = "\t".join(json.dumps(r) for r in row)
+                        fout.write(f"{dump_row}\n")
                 else:
                     raise Exception(
                         "Expecting tuple or torchTensor types for model_outputs"
                     )
+
+
+def dict_zip(*dicts, value_only=False):
+    dict_keys = dicts[0].keys()
+    return (
+        tuple([d[k] for d in dicts] for k in dict_keys)
+        if value_only
+        else {k: [d[k] for d in dicts] for k in dict_keys}
+    )
 
 
 def batch_predict(model_file: str, examples: List[Dict[str, Any]]):

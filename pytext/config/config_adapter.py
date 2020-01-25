@@ -351,6 +351,7 @@ def v6_to_v7(json_config):
         "NewBertRegressionModel",
         "DocRegressionModel",
         "NewWordTaggingModel",
+        "ELModel",
     ):
         # Model has a label tensorizer different from LabelTensorizer.
         return json_config
@@ -649,6 +650,23 @@ def rename_fl_task(json_config):
         new_trainer_name = f"FL{trainer_suffix}"
         for section in find_dicts_containing_key(json_config, old_trainer_name):
             section[new_trainer_name] = section.pop(old_trainer_name)
+    return json_config
+
+
+@register_adapter(from_version=18)
+def upgrade_if_xlm(json_config):
+    """
+    Make `XLMModel` Union changes for encoder and tokens config.
+    Since they are now unions, insert the old class into the config if
+    no class name is mentioned.
+    """
+    _, _, model = find_parameter(json_config, "task.model")
+    if model and "XLMModel" in model:
+        _, inputs, tokens = find_parameter(json_config, "task.model.inputs.tokens")
+        if tokens and "XLMTensorizer" not in tokens:
+            inputs["tokens"] = {}
+            inputs["tokens"]["XLMTensorizer"] = tokens
+
     return json_config
 
 

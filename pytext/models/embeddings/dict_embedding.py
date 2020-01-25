@@ -8,8 +8,9 @@ import torch.onnx.operators
 from pytext.config.field_config import DictFeatConfig
 from pytext.config.module_config import PoolingType
 from pytext.data.tensorizers import Tensorizer
-from pytext.data.utils import Vocabulary
+from pytext.data.utils import PAD_INDEX, UNK_INDEX, Vocabulary
 from pytext.fields import FieldMeta
+from pytext.utils import cuda
 
 from .embedding_base import EmbeddingBase
 
@@ -76,19 +77,56 @@ class DictEmbedding(EmbeddingBase, nn.Embedding):
             if labels is not None
             else metadata.vocab_size
         )
+        tensorizer_vocab_exists = tensorizer and tensorizer.vocab
+        pad_index = (
+            tensorizer.vocab.get_pad_index() if tensorizer_vocab_exists else PAD_INDEX
+        )
+        unk_index = (
+            tensorizer.vocab.get_unk_index() if tensorizer_vocab_exists else UNK_INDEX
+        )
         return cls(
             num_embeddings=vocab_size,
             embed_dim=config.embed_dim,
             pooling_type=config.pooling,
+            pad_index=pad_index,
+            unk_index=unk_index,
+            mobile=config.mobile,
         )
 
     def __init__(
-        self, num_embeddings: int, embed_dim: int, pooling_type: PoolingType
+        self,
+        num_embeddings: int,
+        embed_dim: int,
+        pooling_type: PoolingType,
+        pad_index: int = PAD_INDEX,
+        unk_index: int = UNK_INDEX,
+        mobile: bool = False,
     ) -> None:
+        self.pad_index = pad_index
+        self.unk_index = unk_index
         EmbeddingBase.__init__(self, embed_dim)
-        nn.Embedding.__init__(self, num_embeddings, embed_dim)
+        nn.Embedding.__init__(
+            self, num_embeddings, embed_dim, padding_idx=self.pad_index
+        )
         self.pooling_type = pooling_type
-        self.weight.data.uniform_(0, 0.1)
+        self.mobile = mobile
+
+    def find_and_replace(
+        self, tensor: torch.Tensor, find_val: int, replace_val: int
+    ) -> torch.Tensor:
+        """
+        `torch.where` is not supported for mobile ONNX, this hack allows a mobile
+        exported version of `torch.where` which is computationally more expensive
+        """
+        if self.mobile:
+            mask = torch.eq(tensor, find_val)
+            return tensor * (1 - mask.long()) + mask * replace_val
+        else:
+            return torch.where(
+                tensor == find_val,
+                cuda.GetTensor(torch.full_like(tensor, replace_val)),
+                tensor,
+            )
 
     def forward(
         self, feats: torch.Tensor, weights: torch.Tensor, lengths: torch.Tensor
@@ -114,6 +152,11 @@ class DictEmbedding(EmbeddingBase, nn.Embedding):
         """
         batch_size = torch.onnx.operators.shape_as_tensor(feats)[0]
         max_toks = torch.onnx.operators.shape_as_tensor(lengths)[1]
+
+        if self.unk_index != self.pad_index:
+            # convert all unk indices to pad indices
+            feats = self.find_and_replace(feats, self.unk_index, self.pad_index)
+
         dict_emb = super().forward(feats)
 
         # Calculate weighted average of the embeddings

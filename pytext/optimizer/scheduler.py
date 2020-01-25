@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import math
+from typing import Optional, Union
 
 import torch
 from pytext.config import ConfigBase
-from pytext.config.component import Component, ComponentType
+from pytext.config.component import Component, ComponentType, create_scheduler
 from pytext.optimizer import Optimizer
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR as TorchCosineAnnealingLR,
+    CyclicLR as TorchCyclicLR,
     ExponentialLR as TorchExponentialLR,
     ReduceLROnPlateau as TorchReduceLROnPlateau,
     StepLR as TorchStepLR,
@@ -284,6 +286,46 @@ class CosineAnnealingLR(TorchCosineAnnealingLR, BatchScheduler):
         self.step(epoch)
 
 
+class CyclicLR(TorchCyclicLR, BatchScheduler):
+    """
+    Wrapper around `torch.optim.lr_scheduler.CyclicLR`
+    See the original documentation for more details
+    """
+
+    class Config(Scheduler.Config):
+        base_lr: float = 0.001
+        max_lr: float = 0.002
+        step_size_up: int = 2000
+        step_size_down: Optional[int] = None
+        mode: str = "triangular"
+        gamma: float = 1.0
+        scale_mode: str = "cycle"
+        cycle_momentum: bool = True
+        base_momentum: float = 0.8
+        max_momentum: float = 0.9
+        last_epoch: int = -1
+
+    @classmethod
+    def from_config(cls, config: Config, optimizer: Optimizer):
+        return cls(
+            optimizer=optimizer,
+            base_lr=config.base_lr,
+            max_lr=config.max_lr,
+            step_size_up=config.step_size_up,
+            step_size_down=config.step_size_down,
+            mode=config.mode,
+            gamma=config.gamma,
+            scale_mode=config.scale_mode,
+            cycle_momentum=config.cycle_momentum,
+            base_momentum=config.base_momentum,
+            max_momentum=config.max_momentum,
+            last_epoch=config.last_epoch,
+        )
+
+    def step_batch(self, metrics=None, epoch=None):
+        self.step(epoch)
+
+
 class ExponentialLR(TorchExponentialLR, Scheduler):
     """
     Wrapper around `torch.optim.lr_scheduler.ExponentialLR`
@@ -428,3 +470,70 @@ class PolynomialDecayScheduler(_LRScheduler, BatchScheduler):
         self.current_steps += 1
         # update optimizer.param_groups's learning rate
         self.step()
+
+
+class SchedulerWithWarmup(_LRScheduler, BatchScheduler):
+    """
+    Wraps another scheduler with a warmup phase. After `warmup_steps` defined in
+    warmup_scheduler.warmup_steps, the scheduler will switch to use the specified
+    scheduler in `scheduler`.
+
+    `warmup_scheduler`: is the configuration for the WarmupScheduler, that warms up
+    learning rate over `warmup_steps` linearly.
+
+    `scheduler`: is the main scheduler that will be applied after the warmup phase
+    (once `warmup_steps` have passed)
+    """
+
+    class Config(BatchScheduler.Config):
+        # the definition of the warmup scheduler for the warmup phase
+        warmup_scheduler: WarmupScheduler.Config = WarmupScheduler.Config()
+
+        # the definition of the main scheduler to apply once the warmup phase
+        # has passed
+        scheduler: Union[
+            ExponentialLR.Config,
+            CosineAnnealingLR.Config,
+            ReduceLROnPlateau.Config,
+            LmFineTuning.Config,
+            CyclicLR.Config,
+        ]
+
+    @classmethod
+    def from_config(cls, config: Config, optimizer: Optimizer):
+        warmup_scheduler = create_scheduler(config.warmup_scheduler, optimizer)
+        scheduler = create_scheduler(config.scheduler, optimizer)
+        return cls(
+            optimizer, warmup_scheduler, scheduler, config.warmup_scheduler.warmup_steps
+        )
+
+    def prepare(self, train_iter, total_epochs):
+        super().prepare(train_iter, total_epochs)
+        self.warmup_scheduler.prepare(train_iter, total_epochs)
+        self.scheduler.prepare(train_iter, total_epochs)
+
+    def __init__(self, optimizer, warmup_scheduler, scheduler, switch_steps):
+        self.optimizer = optimizer
+        self.warmup_scheduler = warmup_scheduler
+        self.scheduler = scheduler
+        self.switch_steps = switch_steps
+        self.curr_steps = 0
+
+    def step_batch(self):
+        if self.curr_steps < self.switch_steps:
+            self.curr_steps += 1
+            return self.warmup_scheduler.step_batch()
+        else:
+            return self.scheduler.step_batch()
+
+    def step_epoch(self, metrics, epoch):
+        if self.curr_steps < self.switch_steps:
+            return self.warmup_scheduler.step_epoch(metrics=metrics, epoch=epoch)
+        else:
+            return self.scheduler.step_epoch(metrics=metrics, epoch=None)
+
+    def get_lr(self):
+        if self.curr_steps < self.switch_steps:
+            return self.warmup_scheduler.get_lr()
+        else:
+            return self.scheduler.get_lr()

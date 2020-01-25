@@ -27,7 +27,7 @@ from pytext.optimizer.scheduler import Scheduler
 from pytext.optimizer.sparsifiers.sparsifier import Sparsifier
 from pytext.task.serialize import save
 from pytext.trainers.training_state import TrainingState
-from pytext.utils import cuda, precision, timing
+from pytext.utils import cuda, distributed, precision, timing
 
 
 class TrainerBase(Component):
@@ -96,6 +96,9 @@ class Trainer(TrainerBase):
         target_time_limit_seconds: Optional[int] = None
         #: Whether to do evaluation and model selection based on it.
         do_eval: bool = True
+        #: if do_eval, do we load the best model state dict after training or just
+        # use the latest model state
+        load_best_model_after_train: bool = True
         #: Number of samples for logging training progress.
         num_samples_to_log_progress: int = 1000
         #: Number of forward & backward per batch before update gradients, the
@@ -170,6 +173,7 @@ class Trainer(TrainerBase):
                 output_device=device_id,
                 broadcast_buffers=False,
                 find_unused_parameters=state.model.find_unused_parameters,
+                process_group=distributed._round_robin_process_group,
             )
         state.start_time = time.time()
 
@@ -220,14 +224,9 @@ class Trainer(TrainerBase):
         if not self.config.sparsifier:
             return
 
-        if state.stage != Stage.TRAIN:
-            return
-
-        if state.sparsifier.sparsification_condition(state):
-            state.sparsifier.sparsify(state)
-
+        self.sparsifier.sparsify(state)
         if state.rank == 0:
-            current_sparsity = state.sparsifier.get_current_sparsity(state.model)
+            current_sparsity = self.sparsifier.get_current_sparsity(state.model)
             print(f"sparsity in the model: {current_sparsity}")
 
     def continue_training(self, state: TrainingState) -> bool:
@@ -454,20 +453,27 @@ class Trainer(TrainerBase):
                 self.save_checkpoint(state, train_config)
 
         if self.optimizer.finalize():
-            state.stage = Stage.EVAL
-            model.eval(Stage.EVAL)
-            print(f"start evaluating finalized state")
-            with torch.no_grad():
-                eval_metric = self.run_epoch(state, eval_data, metric_reporter)
-            better_model = metric_reporter.compare_metric(
-                eval_metric, state.best_model_metric
-            )
-            if better_model:
+            should_update_model = True
+            eval_metric = None
+            if self.config.do_eval:
+                state.stage = Stage.EVAL
+                model.eval(Stage.EVAL)
+                print(f"start evaluating finalized state")
+                with torch.no_grad():
+                    eval_metric = self.run_epoch(state, eval_data, metric_reporter)
+                should_update_model = metric_reporter.compare_metric(
+                    eval_metric, state.best_model_metric
+                )
+            if should_update_model:
                 self.update_best_model(state, train_config, eval_metric)
-            if better_model or train_config.save_all_checkpoints:
+            if should_update_model or train_config.save_all_checkpoints:
                 self.save_checkpoint(state, train_config)
         # Only bother loading the best model for master worker
-        if rank == 0 and state.best_model_state is not None:
+        if (
+            rank == 0
+            and state.best_model_state is not None
+            and self.config.load_best_model_after_train
+        ):
             self.load_best_model(state)
 
         return state.model, state.best_model_metric
@@ -509,7 +515,13 @@ class Trainer(TrainerBase):
         if report_metric:
             with timing.time("report metrics"):
                 metrics = metric_reporter.report_metric(
-                    model, state.stage, state.epoch, print_to_channels=(state.rank == 0)
+                    model,
+                    state.stage,
+                    state.epoch,
+                    print_to_channels=(state.rank == 0),
+                    optimizer=getattr(
+                        state, "optimizer", None
+                    ),  # optimizer is not present during test
                 )
         else:
             metric_reporter._reset()

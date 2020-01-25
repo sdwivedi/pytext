@@ -32,6 +32,7 @@ from pytext.utils.documentation import (
     pretty_print_config_class,
     replace_components,
 )
+from pytext.utils.file_io import PathManager
 from pytext.workflow import (
     export_saved_model_to_caffe2,
     export_saved_model_to_torchscript,
@@ -59,7 +60,7 @@ def train_model_distributed(config, metric_channels: Optional[List[Channel]]):
         or config.distributed_world_size <= torch.cuda.device_count()
     ), (
         f"Only {torch.cuda.device_count()} GPUs are available, "
-        "{config.distributed_world_size} GPUs were requested"
+        f"{config.distributed_world_size} GPUs were requested"
     )
 
     print(f"\n=== Starting training, World size is {config.distributed_world_size}")
@@ -190,7 +191,7 @@ def main(context, config_file, config_json, config_module, include):
 
     Example:
 
-      pytext train < demos/docnn.json
+      pytext train < demo/configs/docnn.json
     """
     for path in include or []:
         # remove possible trailing / from autocomplete in --include
@@ -206,7 +207,7 @@ def main(context, config_file, config_json, config_module, include):
                 context.obj.config = import_module(config_module).config
             else:
                 if config_file:
-                    with open(config_file) as file:
+                    with PathManager.open(config_file) as file:
                         config = json.load(file)
                 elif config_json:
                     config = json.loads(config_json)
@@ -214,7 +215,7 @@ def main(context, config_file, config_json, config_module, include):
                     eprint("No config file specified, reading from stdin")
                     config = json.load(sys.stdin)
                 # before parsing the config, include the custom components
-                for path in config.get("include_dirs", []):
+                for path in config.get("include_dirs", None) or []:
                     add_include(path.rstrip("/"))
                 context.obj.config = parse_config(config)
         return context.obj.config
@@ -343,7 +344,9 @@ def _get_model_snapshot(context, model_snapshot, use_cuda, use_tensorboard):
         print(f"No model snapshot provided, loading from config")
         config = context.obj.load_config()
         model_snapshot = config.save_snapshot_path
-        use_cuda = config.use_cuda_if_available
+        use_cuda = config.use_cuda_if_available and getattr(
+            config, "use_cuda_for_testing", True
+        )
         use_tensorboard = config.use_tensorboard
         print(f"Configured model snapshot {model_snapshot}")
     return model_snapshot, use_cuda, use_tensorboard
